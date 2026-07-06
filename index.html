@@ -113,6 +113,8 @@ let state = {
   pos:{keisu:0,gengo:0,eigo:0},
   revealed:false,
   learned:{keisu:{},gengo:{},eigo:{}},   // id -> true
+  quizResults:{keisu:{},gengo:{},eigo:{}}, // qid -> 'right' | 'wrong'（最後に解いた結果を保存）
+  quizWrongOnly:false,                     // クイズを「不正解のみ」で出題するトグル
   listShown:{}
 };
 
@@ -130,6 +132,7 @@ async function loadProgress(){
       const p = JSON.parse(v);
       if(p.learned) state.learned = Object.assign(state.learned, p.learned);
       if(p.pos) state.pos = Object.assign(state.pos, p.pos);
+      if(p.quizResults) state.quizResults = Object.assign(state.quizResults, p.quizResults);
     }
   }catch(e){}
 }
@@ -137,7 +140,7 @@ let saveTimer=null;
 function saveProgress(){
   clearTimeout(saveTimer);
   saveTimer = setTimeout(async ()=>{
-    const payload = JSON.stringify({learned:state.learned, pos:state.pos});
+    const payload = JSON.stringify({learned:state.learned, pos:state.pos, quizResults:state.quizResults});
     try{
       if(window.storage){ await window.storage.set('memo-progress', payload); }
       else if(window.localStorage){ localStorage.setItem('memo-progress', payload); }
@@ -150,6 +153,10 @@ function itemId(tab, idx){
   if(tab==='keisu'){const it=DATA.keisu[idx];return 'k'+(it.num||idx)+'_'+it.q.slice(0,10);}
   if(tab==='gengo'){return 'g'+idx+'_'+DATA.gengo[idx].theme.slice(0,10);}
   return 'e'+idx+'_'+DATA.eigo[idx].theme.slice(0,10);
+}
+// クイズ小問単位の一意ID（言語・英語はテーマ内の何問目かまで区別する）
+function quizId(tab, cur){
+  return itemId(tab, cur.i) + (cur.s!==undefined ? '_s'+cur.s : '');
 }
 function diffStars(d){return d ? d : '無印';}
 function diffCat(d){
@@ -211,7 +218,7 @@ function renderTabs(){
     const b=document.createElement('div');
     b.className='tab'+(state.tab===t.id?' active':'');
     b.textContent=t.label;
-    b.onclick=()=>{state.tab=t.id;state.revealed=false;render();};
+    b.onclick=()=>{state.tab=t.id;state.revealed=false;if(state.mode==='quiz')startQuiz();render();};
     el.appendChild(b);
   });
 }
@@ -224,7 +231,13 @@ function renderStats(){
   let done=0;
   for(let i=0;i<total;i++) if(state.learned[tab][itemId(tab,i)]) done++;
   const pct = total?Math.round(done/total*100):0;
-  el.innerHTML = '覚えた: '+done+' / '+total+'（'+pct+'%）<div class="progressbar"><div style="width:'+pct+'%"></div></div>';
+  // クイズ実績（保存済み）を集計
+  let qr=0,qw=0,qt=0;
+  const countQ=(cur)=>{const v=state.quizResults[tab][quizId(tab,cur)]; if(v==='right')qr++; else if(v==='wrong')qw++; qt++;};
+  if(tab==='keisu')DATA.keisu.forEach((_,i)=>countQ({i}));
+  else if(tab==='gengo')DATA.gengo.forEach((g,i)=>g.items.forEach((_,s)=>countQ({i,s})));
+  else DATA.eigo.forEach((g,i)=>g.items.forEach((x,s)=>{if(x.ans)countQ({i,s});}));
+  el.innerHTML = '覚えた: '+done+' / '+total+'（'+pct+'%）　クイズ: ⭕'+qr+' ❌'+qw+' 未'+(qt-qr-qw)+'<div class="progressbar"><div style="width:'+pct+'%"></div></div>';
 }
 
 function renderChips(){
@@ -259,6 +272,16 @@ function renderControls(){
     b.onclick=()=>{state.mode=m;state.revealed=false;if(m==='quiz')startQuiz();render();};
     el.appendChild(b);
   });
+
+  // クイズモード限定: 保存された不正解だけを出題するトグル
+  if(state.mode==='quiz'){
+    const wc=buildQuizQueue(true).length;
+    const wb=document.createElement('button');
+    wb.className='btn'+(state.quizWrongOnly?' on':'');
+    wb.textContent='❌不正解のみ ('+wc+')';
+    wb.onclick=()=>{state.quizWrongOnly=!state.quizWrongOnly;startQuiz();render();};
+    el.appendChild(wb);
+  }
 
   const shuf=document.createElement('button');
   shuf.className='btn'; shuf.textContent='🔀';
@@ -432,7 +455,7 @@ function renderMain(){
 // ---- quiz mode ----
 function shuffleArr(a){for(let i=a.length-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
 
-function buildQuizQueue(){
+function buildQuizQueue(wrongOnly){
   const tab=state.tab;
   const idxs=filteredIndices(tab);
   let q=[];
@@ -443,12 +466,14 @@ function buildQuizQueue(){
   } else {
     idxs.forEach(i=>DATA.eigo[i].items.forEach((x,s)=>{if(x.ans)q.push({i,s});}));
   }
+  if(wrongOnly) q = q.filter(c=>state.quizResults[tab][quizId(tab,c)]==='wrong');
   return shuffleArr(q);
 }
 
-function startQuiz(fromWrongs){
+// src: 'session' = 直前の1周で間違えた問題 / それ以外 = 通常（quizWrongOnlyトグルに従う）
+function startQuiz(src){
   const z=state.quiz;
-  z.queue = fromWrongs ? shuffleArr(z.wrongs.slice()) : buildQuizQueue();
+  z.queue = src==='session' ? shuffleArr(z.wrongs.slice()) : buildQuizQueue(state.quizWrongOnly);
   z.pos=0; z.answered=false; z.choice=-1; z.right=0; z.wrong=0; z.wrongs=[]; z.options=[];
   if(z.queue.length) prepareOptions();
 }
@@ -493,7 +518,9 @@ function quizCorrectAnswer(){
 function renderQuiz(el){
   const z=state.quiz, tab=state.tab;
   if(!z.queue.length){
-    el.innerHTML='<div class="empty">出題できる問題がないで<br>フィルターを見直してみて</div>';
+    el.innerHTML = state.quizWrongOnly
+      ? '<div class="empty">🎉 保存された不正解はゼロや！<br>「不正解のみ」をOFFにして通常クイズで解いてみて</div>'
+      : '<div class="empty">出題できる問題がないで<br>フィルターを見直してみて</div>';
     return;
   }
   if(z.pos>=z.queue.length){
@@ -509,11 +536,11 @@ function renderQuiz(el){
     if(z.wrongs.length){
       const b=document.createElement('button');
       b.className='btn ng'; b.textContent='間違いだけ再挑戦';
-      b.onclick=()=>{startQuiz(true);render();};
+      b.onclick=()=>{startQuiz('session');render();};
       nav.appendChild(b);
     }
     const b2=document.createElement('button');
-    b2.className='btn ok'; b2.textContent='もう1周（全問）';
+    b2.className='btn ok'; b2.textContent=state.quizWrongOnly?'もう1周（不正解のみ）':'もう1周（全問）';
     b2.onclick=()=>{startQuiz();render();};
     nav.appendChild(b2);
     el.appendChild(nav);
@@ -553,8 +580,17 @@ function renderQuiz(el){
       b.onclick=()=>{
         z.answered=true; z.choice=oi;
         const ok=opt===correct;
-        if(ok){z.right++; if(tab==='keisu'){state.learned.keisu[itemId('keisu',cur.i)]=true;saveProgress();}}
-        else{z.wrong++; z.wrongs.push(cur); if(tab==='keisu'){delete state.learned.keisu[itemId('keisu',cur.i)];saveProgress();}}
+        const qid=quizId(tab,cur);
+        if(ok){
+          z.right++;
+          state.quizResults[tab][qid]='right';   // 正解を保存（不正解履歴は上書きで消える）
+          if(tab==='keisu'){state.learned.keisu[itemId('keisu',cur.i)]=true;}
+        } else {
+          z.wrong++; z.wrongs.push(cur);
+          state.quizResults[tab][qid]='wrong';   // 不正解を保存
+          if(tab==='keisu'){delete state.learned.keisu[itemId('keisu',cur.i)];}
+        }
+        saveProgress();
         render();
       };
     }
